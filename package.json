@@ -1,0 +1,42 @@
+{
+  "name": "@rewindrewind/node",
+  "version": "0.2.0",
+  "description": "RewindRewind server-side SDK for Node and Bun — capture exceptions and events with zero runtime dependencies.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rewind-rewind/rewindrewind-node.git"
+  },
+  "homepage": "https://rewindrewind.com/docs/exception-capture-sdk",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "rewindrewind",
+    "error-tracking",
+    "observability",
+    "exceptions",
+    "node",
+    "bun"
+  ],
+  "license": "MIT",
+  "sideEffects": false
+}
