@@ -52,7 +52,7 @@ const MAX_SCRUB_DEPTH = 12;
 
 export type Platform = "node" | "bun" | "cloudflare" | "deno";
 
-export interface RewindUser {
+export interface RewindIdentity {
   id?: string;
   email?: string;
   [key: string]: unknown;
@@ -78,8 +78,8 @@ export interface RewindConfig {
   release?: string;
   /** Per-request timeout in ms, enforced via AbortController. Default 2000. */
   timeoutMs?: number;
-  /** Default user attached to every exception. */
-  user?: RewindUser;
+  /** Default identity attached to every exception. */
+  identity?: RewindIdentity;
   /** Default tags merged into every exception. */
   tags?: Record<string, unknown>;
   /** Default extra context merged into every exception. */
@@ -88,9 +88,9 @@ export interface RewindConfig {
   debug?: boolean;
   /**
    * Case-insensitive pattern matched against object keys in `tags`, `extra`,
-   * `user`, and event `properties`; matching values are redacted to
-   * `"[FILTERED]"` before the payload leaves the process. Note: `user.id` and
-   * `user.email` are never scrubbed. Defaults to a built-in denylist covering
+   * `identity`, and event `properties`; matching values are redacted to
+   * `"[FILTERED]"` before the payload leaves the process. Note: `identity.id` and
+   * `identity.email` are never scrubbed. Defaults to a built-in denylist covering
    * passwords, tokens, secrets, cookies, credentials, card/SSN data, etc.
    */
   sensitiveKeys?: RegExp;
@@ -112,7 +112,7 @@ export interface CaptureExceptionOptions {
   fingerprint?: string | string[];
   /** Severity. Defaults to "error". */
   level?: string;
-  user?: RewindUser;
+  identity?: RewindIdentity;
   request?: RewindRequest;
   tags?: Record<string, unknown>;
   extra?: Record<string, unknown>;
@@ -161,30 +161,32 @@ export class RewindClient {
   private readonly environment: string;
   private readonly release?: string;
   private readonly timeoutMs: number;
-  private readonly defaultUser?: RewindUser;
+  private readonly defaultIdentity?: RewindIdentity;
   private readonly defaultTags?: Record<string, unknown>;
   private readonly defaultExtra?: Record<string, unknown>;
   private readonly debug: boolean;
   private readonly sensitiveKeys: RegExp;
   private readonly exitOnUncaught: boolean;
+  /** When true (missing/invalid config) every capture is a safe no-op and the
+   *  SDK never throws into the host. */
+  private readonly disabled: boolean;
 
   /** In-flight requests, awaited by {@link flush}. */
   private pending = new Set<Promise<unknown>>();
   private uninstall?: () => void;
 
   constructor(config: RewindConfig) {
+    // Never throw into the host application's startup. Missing or invalid config
+    // (e.g. an unset env var in a preview build) DISABLES the SDK — every capture
+    // becomes a safe no-op — instead of crashing the app. Matches the
+    // Ruby/Python/Go SDKs, which no-op when unconfigured.
+    const reasons: string[] = [];
     const projectKey = (config.projectKey ?? "").trim();
-    if (!projectKey) {
-      throw new Error("RewindRewind: `projectKey` is required");
-    }
-    const environment = (config.environment ?? "").trim();
-    if (!environment) {
-      throw new Error("RewindRewind: `environment` is required and must be non-empty");
-    }
+    if (!projectKey) reasons.push("`projectKey` is required");
+    let environment = (config.environment ?? "").trim();
+    if (!environment) reasons.push("`environment` is required and must be non-empty");
     if (environment.length > MAX_ENVIRONMENT_LENGTH) {
-      throw new Error(
-        `RewindRewind: \`environment\` must be ≤${MAX_ENVIRONMENT_LENGTH} characters`,
-      );
+      environment = environment.slice(0, MAX_ENVIRONMENT_LENGTH);
     }
 
     this.projectKey = projectKey;
@@ -193,11 +195,23 @@ export class RewindClient {
       readEnv("REWINDREWIND_ENDPOINT") ??
       DEFAULT_ENDPOINT
     ).replace(/\/+$/, "");
-    this.endpoint = validateEndpoint(endpoint);
+    let validatedEndpoint = DEFAULT_ENDPOINT;
+    try {
+      validatedEndpoint = validateEndpoint(endpoint);
+    } catch (err) {
+      // A bad endpoint disables the SDK rather than crashing the host — and we
+      // never fall back to sending the key somewhere unvalidated.
+      reasons.push(errorMessage(err));
+    }
+    this.endpoint = validatedEndpoint;
     this.environment = environment;
+    this.disabled = reasons.length > 0;
+    if (this.disabled && typeof console !== "undefined") {
+      console.warn(`[rewindrewind] disabled (captures are no-ops): ${reasons.join("; ")}`);
+    }
     this.release = config.release ?? readEnv("REWINDREWIND_RELEASE");
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.defaultUser = config.user;
+    this.defaultIdentity = config.identity;
     this.defaultTags = config.tags;
     this.defaultExtra = config.extra;
     this.debug = config.debug ?? false;
@@ -218,6 +232,7 @@ export class RewindClient {
     error: unknown,
     options: CaptureExceptionOptions = {},
   ): Promise<TransportResult> {
+    if (this.disabled) return Promise.resolve({ ok: false, status: 0, error: "disabled" });
     try {
       const normalized = normalizeError(error);
       const payload: Record<string, unknown> = {
@@ -234,7 +249,7 @@ export class RewindClient {
         },
         fingerprint: normalizeFingerprint(options.fingerprint),
         request: options.request,
-        user: this.scrubUser(mergeUser(this.defaultUser, options.user)),
+        identity: this.scrubIdentity(mergeIdentity(this.defaultIdentity, options.identity)),
         tags: this.scrub(mergeRecords(this.defaultTags, options.tags)) as
           | Record<string, unknown>
           | undefined,
@@ -255,17 +270,18 @@ export class RewindClient {
     type: string,
     properties: Record<string, unknown> = {},
     options: {
-      distinctId?: string;
+      identityId?: string;
       anonymousId?: string;
       source?: string;
     } = {},
   ): Promise<TransportResult> {
+    if (this.disabled) return Promise.resolve({ ok: false, status: 0, error: "disabled" });
     try {
       const payload: Record<string, unknown> = {
         type,
         environment: this.environment,
         release: this.release,
-        distinct_id: options.distinctId ?? this.defaultUser?.id,
+        identity_id: options.identityId ?? this.defaultIdentity?.id,
         anonymous_id: options.anonymousId,
         source: options.source ?? PLATFORM,
         properties: this.scrub(properties) as Record<string, unknown>,
@@ -368,16 +384,16 @@ export class RewindClient {
   }
 
   /**
-   * Scrub a user object like {@link scrub}, but always preserve `id` and
+   * Scrub an identity object like {@link scrub}, but always preserve `id` and
    * `email` — these are the identity fields the dashboard needs and are never
    * treated as secrets.
    */
-  private scrubUser(user: RewindUser | undefined): RewindUser | undefined {
-    if (!user) return undefined;
-    const scrubbed = this.scrub(user) as Record<string, unknown>;
-    if (user.id !== undefined) scrubbed.id = user.id;
-    if (user.email !== undefined) scrubbed.email = user.email;
-    return scrubbed as RewindUser;
+  private scrubIdentity(identity: RewindIdentity | undefined): RewindIdentity | undefined {
+    if (!identity) return undefined;
+    const scrubbed = this.scrub(identity) as Record<string, unknown>;
+    if (identity.id !== undefined) scrubbed.id = identity.id;
+    if (identity.email !== undefined) scrubbed.email = identity.email;
+    return scrubbed as RewindIdentity;
   }
 
   private send(path: string, body: unknown): Promise<TransportResult> {
@@ -424,30 +440,45 @@ export function getClient(): RewindClient | undefined {
   return defaultClient;
 }
 
-function requireClient(): RewindClient {
-  if (!defaultClient) {
-    throw new Error("RewindRewind: call init(config) before using the default client");
+const NOT_INITIALIZED: TransportResult = { ok: false, status: 0, error: "not_initialized" };
+
+/** Warn once (not throw) when the module API is used before init(); a missing
+ *  init must never crash the host — it just means nothing is captured. */
+function warnNotInitialized(method: string): void {
+  if (typeof console !== "undefined") {
+    console.warn(`[rewindrewind] ${method}() called before init(); ignored`);
   }
-  return defaultClient;
 }
 
 export function captureException(
   error: unknown,
   options?: CaptureExceptionOptions,
 ): Promise<TransportResult> {
-  return requireClient().captureException(error, options);
+  if (!defaultClient) {
+    warnNotInitialized("captureException");
+    return Promise.resolve(NOT_INITIALIZED);
+  }
+  return defaultClient.captureException(error, options);
 }
 
 export function captureEvent(
   type: string,
   properties?: Record<string, unknown>,
-  options?: { distinctId?: string; anonymousId?: string; source?: string },
+  options?: { identityId?: string; anonymousId?: string; source?: string },
 ): Promise<TransportResult> {
-  return requireClient().captureEvent(type, properties, options);
+  if (!defaultClient) {
+    warnNotInitialized("captureEvent");
+    return Promise.resolve(NOT_INITIALIZED);
+  }
+  return defaultClient.captureEvent(type, properties, options);
 }
 
 export function flush(): Promise<void> {
-  return requireClient().flush();
+  if (!defaultClient) {
+    warnNotInitialized("flush");
+    return Promise.resolve();
+  }
+  return defaultClient.flush();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -525,10 +556,10 @@ function normalizeFingerprint(
   return Array.isArray(fingerprint) ? fingerprint.join(":") : fingerprint;
 }
 
-function mergeUser(
-  base: RewindUser | undefined,
-  override: RewindUser | undefined,
-): RewindUser | undefined {
+function mergeIdentity(
+  base: RewindIdentity | undefined,
+  override: RewindIdentity | undefined,
+): RewindIdentity | undefined {
   if (!base && !override) return undefined;
   return { ...base, ...override };
 }
